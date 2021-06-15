@@ -36,10 +36,12 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
@@ -164,6 +166,19 @@ public class CouchbaseContainer extends GenericContainer<CouchbaseContainer> {
     protected void configure() {
         super.configure();
 
+        addExposedPorts(
+            MGMT_PORT,
+            MGMT_SSL_PORT,
+            VIEW_PORT,
+            VIEW_SSL_PORT,
+            QUERY_PORT,
+            QUERY_SSL_PORT,
+            SEARCH_PORT,
+            SEARCH_SSL_PORT,
+            KV_PORT,
+            KV_SSL_PORT
+        );
+
         WaitAllStrategy waitStrategy = new WaitAllStrategy();
 
         // Makes sure that all nodes in the cluster are healthy.
@@ -181,7 +196,7 @@ public class CouchbaseContainer extends GenericContainer<CouchbaseContainer> {
                             .map("healthy"::equals)
                             .orElse(false);
                     } catch (IOException e) {
-                        logger().error("Unable to parse response {}", response, e);
+                        logger().error("Unable to parse response: {}", response, e);
                         return false;
                     }
                 })
@@ -254,15 +269,10 @@ public class CouchbaseContainer extends GenericContainer<CouchbaseContainer> {
     private void initializeServices() {
         logger().debug("Initializing couchbase services on host: {}", enabledServices);
 
-        final String services = enabledServices.stream().map(s -> {
-            switch (s) {
-                case KV: return "kv";
-                case QUERY: return "n1ql";
-                case INDEX: return "index";
-                case SEARCH: return "fts";
-                default: throw new IllegalStateException("Unknown service!");
-            }
-        }).collect(Collectors.joining(","));
+        final String services = enabledServices
+            .stream()
+            .map(CouchbaseService::getIdentifier)
+            .collect(Collectors.joining(","));
 
         @Cleanup Response response = doHttpRequest(MGMT_PORT, "/node/controller/setupServices", "POST", new FormBody.Builder()
             .add("services", services)
@@ -363,10 +373,11 @@ public class CouchbaseContainer extends GenericContainer<CouchbaseContainer> {
             checkSuccessfulResponse(response, "Could not create bucket " + bucket.getName());
 
             new HttpWaitStrategy()
-                .forPath("/pools/default/buckets/" + bucket.getName())
+                .forPath("/pools/default/b/" + bucket.getName())
                 .forPort(MGMT_PORT)
                 .withBasicCredentials(username, password)
                 .forStatusCode(200)
+                .forResponsePredicate(new AllServicesEnabledPredicate())
                 .waitUntilReady(this);
 
             if (enabledServices.contains(CouchbaseService.QUERY)) {
@@ -470,6 +481,40 @@ public class CouchbaseContainer extends GenericContainer<CouchbaseContainer> {
             return HTTP_CLIENT.newCall(requestBuilder.build()).execute();
         } catch (Exception ex) {
             throw new RuntimeException("Could not perform request against couchbase HTTP endpoint ", ex);
+        }
+    }
+
+    /**
+     * In addition to getting a 200, we need to make sure that all services we need are enabled and available on
+     * the bucket.
+     * <p>
+     *  Fixes the issue observed in https://github.com/testcontainers/testcontainers-java/issues/2993
+     */
+    private class AllServicesEnabledPredicate implements Predicate<String> {
+
+        @Override
+        public boolean test(final String rawConfig) {
+            try {
+                for (JsonNode node : MAPPER.readTree(rawConfig).at("/nodesExt")) {
+                    for (CouchbaseService enabledService : enabledServices) {
+                        boolean found = false;
+                        Iterator<String> fieldNames = node.get("services").fieldNames();
+                        while (fieldNames.hasNext()) {
+                            if (fieldNames.next().startsWith(enabledService.getIdentifier())) {
+                                found = true;
+                            }
+                        }
+                        if (!found) {
+                            logger().trace("Service {} not yet part of config, retrying.", enabledService);
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            } catch (IOException ex) {
+                logger().error("Unable to parse response: {}", rawConfig, ex);
+                return false;
+            }
         }
     }
 }
